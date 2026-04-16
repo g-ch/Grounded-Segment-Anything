@@ -13,11 +13,16 @@ from groundingdino.models import build_model
 from groundingdino.util.misc import clean_state_dict
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import get_phrases_from_posmap
+from groundingdino.util.misc import NestedTensor
 
 # ----------------------------------------------------------------------------------------------------------------------
 # OLD API
 # ----------------------------------------------------------------------------------------------------------------------
 
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+# Or more specifically for Supervision warnings:
+warnings.filterwarnings("ignore", message=".*BoxAnnotator is deprecated.*")
 
 def preprocess_caption(caption: str) -> str:
     result = caption.lower().strip()
@@ -83,6 +88,91 @@ def predict(
     ]
 
     return boxes, logits.max(dim=1)[0], phrases
+
+
+
+### CHG changed
+def predict_with_features(
+        model,
+        image: torch.Tensor,
+        caption: str,
+        box_threshold: float,
+        text_threshold: float,
+        device: str = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    caption = preprocess_caption(caption=caption)
+
+    # Print the shape of the image
+    # print(f"caption: {caption}")
+    # print(f"image shape: {image.shape}")
+
+    model = model.to(device)
+    image = image.to(device)
+
+    # Define hook to capture encoder features
+    # encoder_features = None
+    # def hook_fn(module, input, output):
+    #     nonlocal encoder_features
+    #     encoder_features = output.detach().cpu().numpy()
+
+    # Define hook to capture decoder features
+    decoder_features = None
+    def decoder_hook_fn(module, input, output):
+        nonlocal decoder_features
+        decoder_features = output[0]
+
+    # hook_encoder = model.transformer.encoder.layers[-1].register_forward_hook(hook_fn)
+    hook_decoder = model.transformer.register_forward_hook(decoder_hook_fn)
+
+    with torch.no_grad():
+        outputs = model(image[None], captions=[caption])        
+
+    # Remove the hooks
+    # hook_encoder.remove()
+    hook_decoder.remove()
+
+    # Print the encoder features
+    # print("Encoder features:")
+    # print(encoder_features)
+    # print(encoder_features.shape)
+
+    # Print the decoder features
+   #print("Decoder features:")
+    final_layer_features = decoder_features[-1].cpu()[0]
+    # print(final_layer_features)
+    #print(final_layer_features.shape)
+
+    # Consider the prediction logits and boxes
+    prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]  # prediction_logits.shape = (nq, 256)
+    prediction_boxes = outputs["pred_boxes"].cpu()[0]  # prediction_boxes.shape = (nq, 4)
+
+    mask = prediction_logits.max(dim=1)[0] > box_threshold
+    logits = prediction_logits[mask]  # logits.shape = (n, 256)
+    boxes = prediction_boxes[mask]  # boxes.shape = (n, 4)
+    features = final_layer_features[mask]  # features.shape = (n, 256)
+
+    # print("Boxes:")
+    # print(boxes)
+    # print(boxes.shape)
+
+    # print("Logits:")
+    # print(logits)
+    # print(logits.shape)
+
+    # print("Features:")
+    # print(features)
+    # print(features.shape)
+
+    tokenizer = model.tokenizer
+    tokenized = tokenizer(caption)
+
+    phrases = [
+        get_phrases_from_posmap(logit > text_threshold, tokenized, tokenizer).replace('.', '')
+        for logit
+        in logits
+    ]
+
+    return boxes, logits.max(dim=1)[0], phrases, features
 
 
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
@@ -177,7 +267,7 @@ class Model:
         image = cv2.imread(IMAGE_PATH)
 
         model = Model(model_config_path=CONFIG_PATH, model_checkpoint_path=WEIGHTS_PATH)
-        detections = model.predict_with_classes(
+        detections, features = model.predict_with_classes(
             image=image,
             classes=CLASSES,
             box_threshold=BOX_THRESHOLD,
@@ -192,7 +282,8 @@ class Model:
         """
         caption = ". ".join(classes)
         processed_image = Model.preprocess_image(image_bgr=image).to(self.device)
-        boxes, logits, phrases = predict(
+        #boxes, logits, phrases = predict(
+        boxes, logits, phrases, features = predict_with_features(
             model=self.model,
             image=processed_image,
             caption=caption,
@@ -200,6 +291,10 @@ class Model:
             text_threshold=text_threshold,
             device=self.device)
         source_h, source_w, _ = image.shape
+
+        # Get visual features from the model.
+
+        # Post-process the result to the right output format.
         detections = Model.post_process_result(
             source_h=source_h,
             source_w=source_w,
@@ -207,8 +302,8 @@ class Model:
             logits=logits)
         class_id = Model.phrases2classes(phrases=phrases, classes=classes)
         detections.class_id = class_id
-        return detections
-
+        return detections, features
+    
     @staticmethod
     def preprocess_image(image_bgr: np.ndarray) -> torch.Tensor:
         transform = T.Compose(
